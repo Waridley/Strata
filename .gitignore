@@ -25,6 +25,9 @@ __pycache__/
 *.occ1
 td.log
 
+# the compose .env a user copies from .env.example (holds the API key)
+tools/docker/compose/.env
+
 # created by terminal/setup.py on the user's machine
 /terminal/.venv/
 /.venv/

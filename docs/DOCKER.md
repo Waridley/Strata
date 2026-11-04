@@ -6,8 +6,9 @@ Intel Arc needs prepared model files. Keep the data volume to reuse downloads an
 
 > **On this page:** [Which image](#which-image-for-which-card) · [One command per card](#one-command-per-card) ·
 > [Docker Compose](#docker-compose) · [Settings](#settings) · [The API key](#the-api-key) · [Connect your apps](#connect-your-coding-apps) ·
-> [Watch and stop](#watch-it-and-stop-it) · [Update](#updating) · [Troubleshooting](#troubleshooting) · [Podman](#podman-rootless-on-ubuntu) ·
-> [From the older image](#from-the-older-image) · [Build it yourself](#build-it-yourself)
+> [Watch and stop](#watch-it-and-stop-it) · [Change the model at runtime](#changing-the-model-at-runtime) · [Update](#updating) ·
+> [Troubleshooting](#troubleshooting) · [Podman](#podman-rootless-on-ubuntu) · [From the older image](#from-the-older-image) ·
+> [Build it yourself](#build-it-yourself)
 
 Docker on a **Mac** has no access to the Mac's graphics chip (no Metal): use the Mac app or the Terminal
 ([MAC.md](MAC.md), [TERMINAL_LAUNCH.md](TERMINAL_LAUNCH.md)). Docker Desktop on **Windows** passes NVIDIA cards through
@@ -117,7 +118,7 @@ GGUF files, so the GGUF folder should be on a fast SSD.
 ## Docker Compose
 
 Ready-made files are in [docker/compose/](../tools/docker/compose): `docker-compose.nvidia.yml`, `docker-compose.amd.yml`,
-`docker-compose.intel.yml` and `.env.example`. Copy the one for your card and its `.env.example`, edit, start:
+`docker-compose.intel.yml`, `docker-compose.cuda-src.yml` and `.env.example`. Copy the one for your card and its `.env.example`, edit, start:
 
 ```sh
 cd tools/docker/compose
@@ -129,7 +130,13 @@ docker compose -f docker-compose.nvidia.yml logs -f
 They set what the commands above set: the GPU (`deploy.resources.reservations.devices` for NVIDIA, `/dev/kfd` and
 `/dev/dri` plus the `video` and `render` groups for AMD, `/dev/dri` for Intel), `ulimits.memlock`, `shm_size`, a two-minute
 `stop_grace_period`, the `strata-data` volume, and the port bound to `127.0.0.1`. To let other computers reach it, set
-`STRATA_BIND=0.0.0.0` in `.env` and keep a real `API_KEY`.
+`STRATA_BIND=0.0.0.0` in `.env` and keep a real `API_KEY`. To keep the volume's files on a big disk, set
+`STRATA_DATA_DIR=/mnt/big/strata` (the folder must be writable by the container).
+
+`docker-compose.cuda-src.yml` is for a source checkout: its first `up` compiles the engine into the image (about 25
+minutes, once) and starts the same container as above. It needs `STRATA_COMMIT` in `.env` (`git rev-parse HEAD`), because
+`.git` is not copied into the build. Its header lists the build arguments: one card only, pictures, CUDA 12 for a GTX 10.
+More ways to build: [Build it yourself](#build-it-yourself).
 
 ## Settings
 
@@ -155,6 +162,7 @@ screens; leave out what you do not care about.
 | `TUNE_ALLOW_SMALL` | `1` passes `--tune-allow-small` to `launch` (allow tuning on a small card) | `0` |
 | `PORT` | the port inside the container | `8080` |
 | `PRESET` | the preset name in `/data` | `docker` |
+| `STAY_UP` | `1`: keep the container up when the server is not running, so a model can be switched in it with `docker exec strata strata launch ... --restart` ([below](#changing-the-model-at-runtime)). Off: the container leaves when the server is gone, so a restart policy starts it again | off |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
 
 The route tail skip (skipping rarely used parts of the model) is off in the container, as everywhere. `STRATA_SET="STRATA_ROUTE_TAIL_SKIP=7"` turns it on;
@@ -235,6 +243,45 @@ docker start strata                         # serving again in about a minute: t
 The health check asks `GET /v1/models` with the key. During the first download the container shows `starting`, not `unhealthy`.
 `docker stop` sends SIGTERM; the container runs `strata launch --stop`, so the engine releases its memory properly. Give it time
 (`--stop-timeout 120` or compose's `stop_grace_period: 2m`): with the default 10 seconds a big model can be killed (exit 137).
+
+## Changing the model at runtime
+
+Switch the model inside a running container, at the same address. `launch` stops the model that is serving, loads the new one
+and the server comes back on the same port:
+
+```sh
+docker exec strata strata launch --family swift --model IQ3_XXS --data-dir /data/Strata-data \
+  --access lan --port 8080 --preset docker --save-preset docker --restart --no-tui
+```
+
+- `--restart` stops the model that serves other choices (answers in progress stop) and starts these. Without it, `--no-tui`
+  refuses with one line naming the running model.
+- `--save-preset docker` keeps the choice: the container starts with this model next time, with no settings in `.env` to
+  override it (see below). A new model that is not in the volume downloads first (tens of GB, resumable); a model already in
+  the volume loads in about a minute.
+- Nothing in the image changes for a model switch, so this needs no rebuild: the model, the preset and the tuning are in the
+  volume. `docker exec strata strata launch --list-presets` lists the saved presets, `--status` what is serving,
+  and `--model-path /models` (with a mounted folder) starts files you already have.
+- To set the model that a container start uses from `.env`, change `MODEL` and `FAMILY` there and recreate the container:
+  `docker compose -f docker-compose.cuda-src.yml up -d --force-recreate`. A `.env` change is not a build; the CUDA build's
+  cached layers are reused (read from the Dockerfile's stages, not measured), and no model is downloaded again if the files
+  are in the volume.
+
+For this workflow, three settings. What ends the container during a switch is the container's own watchdog, not Docker's health
+check: the entry point leaves when the server has not been ready for 30 seconds, and `restart: unless-stopped` then starts the
+container again with the settings in `.env` (a restart policy acts on the container exiting; health status is not a trigger,
+only Swarm's `deploy.restart_policy` and compose's `depends_on: condition: service_healthy` read it).
+
+- **`STAY_UP=1`.** A switch stops the server and loads the new model, which takes a minute. Off, the container leaves after
+  about 30 seconds of the server being gone, and `restart: unless-stopped` starts it again with the settings in `.env`, so
+  the model you switched to is lost. With `STAY_UP=1` the container stays up while the server is not running.
+- **`healthcheck: { disable: true }` in the compose service.** The image's health check is healthy only when a model is
+  loaded, so a container that is switching a model shows `unhealthy` in `docker ps`. A plain container does not restart from
+  its health status (only Swarm and `depends_on: condition: service_healthy` act on it), so disabling the check is safe, and
+  the switch stops looking as a failure. Watch the server yourself instead: `docker exec strata strata monitor --once`,
+  `GET /health` (answers without a key, and says `"loaded": false`).
+- **Leave `MODEL` and `FAMILY` empty in `.env`.** A start with those set saves them over the saved preset, so a model switch
+  is lost at the next start. With them empty, a start uses the preset in the volume.
 
 ## Updating
 
@@ -390,6 +437,8 @@ repository compiles the CUDA 13 engines (`strata`, plus shape engines `strata-hy
 (`--build-arg CUDA_ARCHITECTURES=89` for one card only, much faster). The source Dockerfile is not the ready-made image's one, so it is
 named with `-f`; the build then takes its ignore list from `tools/docker/Dockerfile.src.dockerignore`. `.git` is not copied into the build,
 so the commit comes in as `STRATA_COMMIT`; without it the Terminal stage stops.
+The same build and start in one file: `tools/docker/compose/docker-compose.cuda-src.yml` (its `CUDA_ARCHITECTURES` names one card, so the
+build is faster; `STRATA_COMMIT` comes from `.env`).
 For a GTX 10, P100 or V100 build the CUDA 12 variant: `docker build -t strata:src-cuda12 --build-arg STRATA_COMMIT=$(git rev-parse HEAD)
 -f tools/docker/Dockerfile.src --build-arg CUDA_IMAGE=nvidia/cuda:12.9.2-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" .`
 (the build turns on the Pascal / Volta code by itself when an architecture below 75 is listed, and names the package `cuda12` with

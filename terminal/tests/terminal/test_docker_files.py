@@ -173,10 +173,15 @@ class Compose(unittest.TestCase):
         self.assertIn("strata", data["services"], name)
         return data
 
+    def data_source(self, svc: dict) -> str:
+        """Where the container's /data comes from, as the compose files write it: the named volume, or the folder STRATA_DATA_DIR names."""
+        source = [v for v in svc["volumes"] if v.endswith(":/data")][0].rsplit(":", 1)[0]
+        return re.sub(r"\$\{STRATA_DATA_DIR:-(.*)\}$", r"\1", source)
+
     def test_common_settings(self):
-        for name in ("docker-compose.nvidia.yml", "docker-compose.amd.yml", "docker-compose.intel.yml"):
+        for name in ("docker-compose.nvidia.yml", "docker-compose.amd.yml", "docker-compose.intel.yml", "docker-compose.cuda-src.yml"):
             svc = self.load(name)["services"]["strata"]
-            self.assertIn("strata-data:/data", svc["volumes"], name)
+            self.assertEqual(self.data_source(svc), "strata-data", f"{name}: /data must be the named volume (or a folder the user names)")
             self.assertEqual(svc["ulimits"]["memlock"], {"soft": -1, "hard": -1}, name)
             self.assertEqual(svc["shm_size"], "2gb", name)
             self.assertEqual(svc["stop_grace_period"], "2m", name)
@@ -198,6 +203,25 @@ class Compose(unittest.TestCase):
         intel = self.load("docker-compose.intel.yml")["services"]["strata"]
         self.assertIn("/dev/dri:/dev/dri", intel["devices"])
         self.assertNotIn("/dev/kfd:/dev/kfd", intel["devices"])
+
+    def test_the_source_compose_file_builds_from_this_checkout(self):
+        """docker-compose.cuda-src.yml: the CUDA 13 source build (the same Dockerfile `docker build` uses), with the GPU access of the nvidia file.
+        .git is not in the build context, so the commit must come in as STRATA_COMMIT; docs/DOCKER.md names the file and the two compose-only variables."""
+        svc = self.load("docker-compose.cuda-src.yml")["services"]["strata"]
+        self.assertEqual(svc["build"]["context"], "../../..")
+        self.assertEqual(svc["build"]["dockerfile"], "tools/docker/Dockerfile.src")
+        args = svc["build"]["args"]
+        self.assertEqual(args["CUDA_IMAGE"], "nvidia/cuda:13.0.0-devel-ubuntu24.04")
+        self.assertEqual(args["RUNTIME_BASE"], "ubuntu:24.04")
+        self.assertIn("CUDA_ARCHITECTURES", args)          # one card, so the build is fast (the Dockerfile's default builds all)
+        self.assertEqual(args["STRATA_COMMIT"], "${STRATA_COMMIT:-}")
+        dev = svc["deploy"]["resources"]["reservations"]["devices"][0]
+        self.assertEqual(dev["driver"], "nvidia")
+        self.assertIn("gpu", dev["capabilities"])
+        env_example = (DOCKER / "compose" / ".env.example").read_text(encoding="utf-8")
+        for var in ("STRATA_COMMIT", "STRATA_DATA_DIR", "FAMILY"):
+            self.assertIn(var, env_example, f".env.example: {var}")
+        self.assertIn("docker-compose.cuda-src.yml", (ROOT.parent / "docs" / "DOCKER.md").read_text(encoding="utf-8"))
 
 
 @unittest.skipIf(SH is None, "needs sh")
@@ -308,6 +332,71 @@ class LegacyModelsGuard(unittest.TestCase):
                     dummy.rmdir()
                     self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                     self.assertIn("holds no", r.stderr)
+
+
+@unittest.skipIf(SH is None, "needs sh")
+class StayUp(unittest.TestCase):
+    """STAY_UP=1 in the container's keep-up loop: it stays up when the server is not running, so a model can be switched
+    in the same container (`docker exec strata strata launch ... --restart`). Without it the container leaves as before,
+    so a restart policy can start it again (which is how the switch was lost)."""
+
+    FAKE = '#!/bin/sh\nn=$(cat "$CNT")\nif [ "$n" -le "$READY_AFTER" ] || [ "$n" -gt "$FLIP" ]; then echo \'{"state": "ready"}\'; ' \
+           'else echo \'{"state": "starting", "phase": "loading"}\'; fi\n'
+
+    def run_loop(self, stayup: str, checks: int, ready_after: int, flip: int = 10 ** 6):
+        """The loop with the server ready for the first `ready_after` checks, then not ready until the check after `flip`,
+        `checks` checks in all, and STAY_UP=stayup."""
+        import os
+        import tempfile
+        entry = (DOCKER / "entrypoint.sh").read_text(encoding="utf-8")
+        start = entry.index('bad=0\nnotice=""\nwhile [ -z "$stopping" ]; do')
+        body = entry[start:entry.index("\ndone\n", start) + len("\ndone\n")]
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake.sh"
+            fake.write_text(self.FAKE, encoding="utf-8", newline="\n")
+            fake.chmod(0o755)
+            script = Path(tmp) / "loop.sh"
+            lines = [
+                "warn() { printf '[!] %s\\n' \"$*\" >&2; }",
+                "say() { printf '%s\\n' \"$*\"; }",
+                "die() { printf '[X] %s\\n' \"$*\" >&2; exit \"${2:-1}\"; }",
+                "phase() { printf '%s\\n' \"$1\" > \"$PHASE_FILE\" 2>/dev/null || true; }",
+                "PRESET=docker",
+                "PORT=8080",
+                f"export PHASE_FILE={tmp}/cnt-phase CNT={tmp}/cnt READY_AFTER={ready_after} FLIP={flip} MAX={checks} STRATA={sh_path(fake)}",
+                f"stayup={stayup}",
+                'stopping=""',
+                "trap 'stopping=1' INT",
+                'printf 0 > "$CNT"',
+                'sleep() { n=$(cat "$CNT"); printf %s "$((n+1))" > "$CNT"; if [ "$n" -ge "$MAX" ]; then kill -INT $$; fi; }',
+                body,
+            ]
+            script.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+            r = subprocess.run([SH, sh_path(script)], capture_output=True, text=True, env=dict(os.environ))
+            phase = (Path(tmp) / "cnt-phase").read_text(encoding="utf-8").strip() if (Path(tmp) / "cnt-phase").exists() else ""
+            return r, phase
+
+    def test_it_keeps_the_container_up_and_names_the_switch_command(self):
+        r, phase = self.run_loop("1", 6, 0)              # never ready: the container must not leave
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("STAY_UP=1", r.stderr)
+        self.assertIn("docker exec strata strata launch --family swift --model IQ3_XXS --data-dir /data/Strata-data --access lan --port 8080 --preset docker --save-preset docker --restart --no-tui", r.stderr)
+        self.assertIn("--save-preset docker --restart --no-tui", r.stderr)
+        self.assertIn("MODEL", r.stderr)                 # the note about leaving MODEL / FAMILY empty
+        self.assertIn("switching", phase)
+
+    def test_the_container_leaves_without_stay_up_as_before(self):
+        r, phase = self.run_loop("", 6, 0)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("The server is no longer running", r.stderr)
+        self.assertNotIn("STAY_UP", r.stderr)
+        self.assertIn("failed", phase)
+
+    def test_it_says_when_the_server_is_serving_again(self):
+        r, phase = self.run_loop("1", 6, 2, 3)           # ready, not ready (the switch), ready again
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("The server is serving again", r.stdout)
+        self.assertIn("serving", phase)
 
 
 class Document(unittest.TestCase):

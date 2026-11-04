@@ -21,6 +21,7 @@ services:
       PARALLEL: ${PARALLEL:-}                # empty: fit to the card
       VISION: ${VISION:-off}                 # on: the model reads pictures (about 0.9 GB more to download)
       TUNE: ${TUNE:-skip}                    # quick: up to about 20 minutes, once, then kept
+      STAY_UP: ${STAY_UP:-}                 # 1: keep the container up while the server is not running, so a model can be switched in it (docs/DOCKER.md, "Changing the model at runtime"); off: the container leaves when the server is gone
       API_KEY: ${API_KEY:-}                  # empty: made on the first start; docker exec strata strata launch --show-key
       # GPUS: "0,1"                          # several cards: which ones
     volumes:
@@ -38,5 +39,9 @@ services:
       memlock: { soft: -1, hard: -1 }        # the engine pins tens of GB of RAM
     shm_size: 2gb
     stop_grace_period: 2m                    # the model drains and unloads on docker stop
+    # the image's health check is healthy only when a model is loaded, so a container that is switching a model shows as
+    # unhealthy. A health status does not restart a plain container (the entry point's watchdog does, when the server is not
+    # ready); for a model switch at runtime, STAY_UP=1 and `healthcheck: { disable: true }` keep the container up
+    # (docs/DOCKER.md, "Changing the model at runtime").
 volumes:
   strata-data:

@@ -20,6 +20,7 @@ services:
       PARALLEL: ${PARALLEL:-}
       VISION: ${VISION:-off}
       TUNE: ${TUNE:-skip}
+      STAY_UP: ${STAY_UP:-}     # 1: keep the container up while the server is not running, so a model can be switched in it (docs/DOCKER.md, "Changing the model at runtime")
       API_KEY: ${API_KEY:-}
     volumes:
       - strata-data:/data
@@ -34,6 +35,8 @@ services:
       memlock: { soft: -1, hard: -1 }
     shm_size: 2gb
     stop_grace_period: 2m
+    # a health status does not restart a plain container; for a model switch at runtime, disable the health check
+    # (`healthcheck: { disable: true }`) and use STAY_UP=1, docs/DOCKER.md "Changing the model at runtime"
     # security_opt: [seccomp:unconfined]     # only if the log says a ROCm call was blocked (rare)
 volumes:
   strata-data:
