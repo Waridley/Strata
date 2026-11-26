@@ -1013,6 +1013,13 @@ class Runner:
         if self.cancel.is_set():
             raise Cancelled()
 
+    def check_retired(self) -> None:
+        """A saved DeepSeek preset must be refused before the engine, model, or run-config steps touch it."""
+        from strata_control import retired
+        s = self.s
+        if retired.is_name(s.family) or retired.is_name(s.model):
+            raise LaunchError(retired.refusal(None, s.name or s.model or retired.title()), "", 2)
+
     @property
     def catalog(self) -> Catalog:
         if self._catalog is None:
@@ -1565,6 +1572,7 @@ class Runner:
         """What this launch still needs for the model, in numbers and words (strata_cli/launch/modelstate.py)."""
         from strata_cli.launch import modelstate
         s = self.s
+        self.check_retired()
         self.resolved_vision()
         path, desc = (None, None)
         installed = True
@@ -3122,6 +3130,7 @@ class Runner:
 
     def plan(self) -> dict:
         s = self.s
+        self.check_retired()
         self.keep_saved_off()                                # the plan names the drafter the start will run
         self.keep_saved_word()
         self.check_own_files()
@@ -3295,6 +3304,7 @@ class Runner:
 
     def run(self, *, start: bool = True) -> Result:
         self.restart_after = start
+        self.check_retired()
         self.keep_saved_off()
         self.keep_saved_word()                               # a restart with no word keeps the saved one (it was written as null before)
         try:

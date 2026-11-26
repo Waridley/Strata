@@ -236,5 +236,32 @@ class Launch(unittest.TestCase):
         self.assertEqual((s.family, s.model), ("qwen", "IQ3_S"))
 
 
+class SavedLaunchPreset(unittest.TestCase):
+    """The TUI can start a saved launch preset through Runner directly; it must refuse a DeepSeek preset before the model-state lookup."""
+
+    def test_saved_deepseek_preset_refuses_before_runner_steps(self):
+        from strata_cli.launch import settings as S
+        from strata_cli.launch.runner import LaunchError, Runner
+
+        s = S.LaunchSettings()
+        s.family = retired.FAMILY
+        s.model = "ist-das-2.00bpw"
+        s.name = "DeepSeek-V4.1-Flash"
+        with self.assertRaises(LaunchError) as caught:
+            Runner(s).check_retired()
+        self.assertIn(D1_HEAD, caught.exception.text)
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_qwen_preset_passes(self):
+        from strata_cli.launch import settings as S
+        from strata_cli.launch.runner import Runner
+
+        s = S.LaunchSettings()
+        s.family = "qwen"
+        s.model = "iq3_xxs"
+        s.name = "Office"
+        Runner(s).check_retired()
+
+
 if __name__ == "__main__":
     unittest.main()
