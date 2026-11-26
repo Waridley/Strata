@@ -1,0 +1,64 @@
+# Strata built FROM SOURCE with CUDA 13 (RTX 20-50, driver 580+). The engine is compiled inside the image: nothing is
+# downloaded for the build. Needs the NVIDIA Container Toolkit on the host.
+# The ready-made image (docker-compose.nvidia.yml, nothing compiled) suits most cards: docs/DOCKER.md.
+#
+#   cp .env.example .env          # STRATA_COMMIT is needed for the build: git rev-parse HEAD
+#   docker compose -f docker-compose.cuda-src.yml up -d       # the first up compiles the engine (about 25 minutes)
+#   docker compose -f docker-compose.cuda-src.yml logs -f     # the first start downloads the model (resumable)
+#
+# CUDA_ARCHITECTURES below names one card only, so the build is faster (86 = RTX 30, 89 = RTX 40, 120 = RTX 50); the
+# Dockerfile's default builds 75;80;86;89;120. For a GTX 10 / P100 / V100 build use CUDA 12 with the arguments in the
+# Dockerfile header (and BUILD_DSV41=0: the Pascal / Volta variant has no DeepSeek path). AMD and Intel from-source
+# builds: docs/AMD_HIP.md, docs/INTEL.md.
+
+services:
+  strata:
+    # ---- Build from this checkout (the published image is not compiled): docs/DOCKER.md "Build it yourself" ----
+    build:
+      context: ../..                                # the repository root (docker/compose/../../)
+      dockerfile: Dockerfile                        # the source-build Dockerfile at that root
+      args:
+        CUDA_IMAGE: nvidia/cuda:13.0.0-devel-ubuntu24.04
+        RUNTIME_BASE: ubuntu:24.04
+        CUDA_ARCHITECTURES: 86                      # one card (RTX 30xx): faster build; 75;80;86;89;120 for all
+        # BUILD_VISION: "1"                         # picture-reading support
+        # BUILD_DSV41: "1"                          # the DeepSeek-V4.1 engine beside the engine (CUDA 13 only)
+        STRATA_COMMIT: ${STRATA_COMMIT:-}           # .git is not copied into the build, so the commit comes as this arg
+    image: strata:src                               # the tag the built image gets
+    container_name: strata
+    restart: unless-stopped
+    ports:
+      - "${STRATA_BIND:-127.0.0.1}:${STRATA_PORT:-8080}:8080"      # 127.0.0.1 = this computer only. 0.0.0.0 = your network: keep the API key then.
+    environment:
+      MODEL: ${MODEL:-}                      # empty: Strata picks the one it recommends for your card, and says so in the log
+      FAMILY: ${FAMILY:-}                    # qwen, swift, unsloth, coder, gyro, ...; empty: Strata's pick. Set it to the family a model already in /data comes from, or a restart plans a fresh model
+      MODEL_PATH: ${MODEL_PATH:-}            # GGUF files you already have, as seen inside the container (mount them below)
+      CONTEXT: ${CONTEXT:-32k}
+      PARALLEL: ${PARALLEL:-}                # empty: fit to the card
+      VISION: ${VISION:-off}                 # on: the model reads pictures (about 0.9 GB more to download)
+      TUNE: ${TUNE:-skip}                    # quick: up to about 20 minutes, once, then kept
+      STAY_UP: ${STAY_UP:-}                  # 1: keep the container up while the server is not running, so a model can be switched in it (docs/DOCKER.md, "Changing the model at runtime"); off: the container leaves when the server is gone
+      API_KEY: ${API_KEY:-}                  # empty: made on the first start; docker exec strata strata launch --show-key
+      # GPUS: "0,1"                          # several cards: which ones
+    volumes:
+      - ${STRATA_DATA_DIR:-strata-data}:/data    # the model, presets, tuning, the key. Survives updates of the image.
+                                                 # a big disk: STRATA_DATA_DIR=/mnt/big/strata in .env (the folder must be writable by the container)
+      # - /srv/gguf/IQ3_XXS:/models:ro       # GGUF files you already have (then also set MODEL_PATH: /models)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all                     # or: device_ids: ["0"]
+              capabilities: [gpu]
+    # the short form of the same: gpus: all
+    ulimits:
+      memlock: { soft: -1, hard: -1 }        # the engine pins tens of GB of RAM
+    shm_size: 2gb
+    stop_grace_period: 2m                    # the model drains and unloads on docker stop
+    # the image's health check is healthy only when a model is loaded. `restart: unless-stopped` reacts to the container
+    # exiting, not to health: the container exits on its own watchdog when the server is not ready for about 30 seconds.
+    # For a model switch at runtime set STAY_UP=1, and add `healthcheck: { disable: true }` so the switch does not show as
+    # unhealthy (docs/DOCKER.md, "Changing the model at runtime").
+volumes:
+  strata-data:

@@ -114,10 +114,15 @@ class Compose(unittest.TestCase):
         self.assertIn("strata", data["services"], name)
         return data
 
+    def data_source(self, svc: dict) -> str:
+        """Where the container's /data comes from, as the compose files write it: the named volume, or the folder STRATA_DATA_DIR names."""
+        source = [v for v in svc["volumes"] if v.endswith(":/data")][0].rsplit(":", 1)[0]
+        return re.sub(r"\$\{STRATA_DATA_DIR:-(.*)\}$", r"\1", source)
+
     def test_common_settings(self):
-        for name in ("docker-compose.nvidia.yml", "docker-compose.amd.yml", "docker-compose.intel.yml"):
+        for name in ("docker-compose.nvidia.yml", "docker-compose.amd.yml", "docker-compose.intel.yml", "docker-compose.cuda-src.yml"):
             svc = self.load(name)["services"]["strata"]
-            self.assertIn("strata-data:/data", svc["volumes"], name)
+            self.assertEqual(self.data_source(svc), "strata-data", f"{name}: /data must be the named volume (or a folder the user names)")
             self.assertEqual(svc["ulimits"]["memlock"], {"soft": -1, "hard": -1}, name)
             self.assertEqual(svc["shm_size"], "2gb", name)
             self.assertEqual(svc["stop_grace_period"], "2m", name)
@@ -139,6 +144,27 @@ class Compose(unittest.TestCase):
         intel = self.load("docker-compose.intel.yml")["services"]["strata"]
         self.assertIn("/dev/dri:/dev/dri", intel["devices"])
         self.assertNotIn("/dev/kfd:/dev/kfd", intel["devices"])
+
+    def test_the_source_compose_file_builds_from_this_checkout(self):
+        """docker-compose.cuda-src.yml: the CUDA 13 source build (the same Dockerfile `docker build` uses), with the GPU access of the nvidia file.
+        .git is not in the build context, so the commit must come in as STRATA_COMMIT; docs/DOCKER.md names the file and the two compose-only variables."""
+        svc = self.load("docker-compose.cuda-src.yml")["services"]["strata"]
+        self.assertEqual(svc["build"]["context"], "../..")
+        self.assertEqual(svc["build"]["dockerfile"], "Dockerfile")
+        args = svc["build"]["args"]
+        self.assertEqual(args["CUDA_IMAGE"], "nvidia/cuda:13.0.0-devel-ubuntu24.04")
+        self.assertEqual(args["RUNTIME_BASE"], "ubuntu:24.04")
+        self.assertIn("CUDA_ARCHITECTURES", args)          # one card, so the build is fast (the Dockerfile's default builds all)
+        self.assertEqual(args["STRATA_COMMIT"], "${STRATA_COMMIT:-}")
+        dev = svc["deploy"]["resources"]["reservations"]["devices"][0]
+        self.assertEqual(dev["driver"], "nvidia")
+        self.assertIn("gpu", dev["capabilities"])
+        env_example = (DOCKER / "compose" / ".env.example").read_text(encoding="utf-8")
+        for var in ("STRATA_COMMIT", "STRATA_DATA_DIR"):
+            self.assertIn(var, env_example, f".env.example: {var}")
+        doc = (ROOT / "docs" / "DOCKER.md").read_text(encoding="utf-8")
+        self.assertIn("docker-compose.cuda-src.yml", doc)
+        self.assertIn("STAY_UP", doc)
 
 
 @unittest.skipIf(SH is None, "needs sh")

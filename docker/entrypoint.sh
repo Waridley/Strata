@@ -23,6 +23,9 @@
 #                 not serve beyond loopback without a key, so one is always on: yours, or one made on the first start and kept in /data.
 #   PRESET        preset name in /data (default "docker"). Settings above are saved into it; with no settings given a saved preset is reused.
 #   STRATA_SET    advanced engine settings, space separated KEY=VALUE (like `strata launch --set`)
+#   STAY_UP       1: keep the container up when the server is not running, so a model can be switched in it with
+#                 `docker exec strata strata launch --family qwen --model IQ3_XXS --data-dir /data/Strata-data --access lan --port 8080 --preset docker --save-preset docker --restart --no-tui`
+#                 (docs/DOCKER.md, "Changing the model at runtime"). Off: the container leaves, as before.
 set -u
 
 APP=/opt/strata
@@ -38,6 +41,15 @@ say()  { printf '%s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 die()  { printf '[X] %s\n' "$*" >&2; exit "${2:-1}"; }
 phase() { printf '%s\n' "$1" > "$PHASE_FILE" 2>/dev/null || true; }
+
+# STAY_UP=1: the keep-up loop below does not leave when the server is not running, so a model can be switched in this same
+# container (`docker exec strata strata launch ... --restart`). Off (the default) leaves, so a restart policy can act.
+stayup=""
+case "$(printf '%s' "${STAY_UP:-}" | tr 'A-Z' 'a-z')" in
+  ""|off|no|false|0) ;;
+  1|on|yes|true) stayup=1 ;;
+  *) die "STAY_UP=${STAY_UP:-} is not one of 1, off. Nothing was started." 2 ;;
+esac
 
 # Model files of the older layout that this image did not move (a folder you mounted at /data/models, or a move that failed) are not read here, and
 # the start would download the model again. Say so and stop instead (#3421); ALLOW_DOWNLOAD=1 goes on, with the same text as a warning.
@@ -302,13 +314,31 @@ phase serving
 say "Serving on port $PORT. Watch it: docker exec -it <container> strata monitor    Stop: docker stop <container>"
 
 # ---- stay up; leave (so a restart policy can act) if the server is gone
+# STAY_UP=1 keeps the container up when the server is not running, so a model can be switched in this same container
+# (docs/DOCKER.md, "Changing the model at runtime"). A switch stops the server and loads the new model, which takes a
+# minute; leaving during that minute ends the container into the restart policy, and the policy starts it again with the
+# settings in .env, so the model that was just chosen is lost. Without STAY_UP the container leaves as before.
 bad=0
+notice=""
 while [ -z "$stopping" ]; do
   sleep 10 &
   wait $!
   [ -n "$stopping" ] && break
-  if "$STRATA" launch --status --output json 2>/dev/null | grep -q '"state": *"ready"'; then bad=0; else bad=$((bad+1)); fi
-  if [ "$bad" -ge 3 ]; then
+  if "$STRATA" launch --status --output json 2>/dev/null | grep -q '"state": *"ready"'; then
+    bad=0
+    [ -n "$notice" ] && { notice=""; phase serving; say "The server is serving again."; }
+    continue
+  fi
+  bad=$((bad+1))
+  if [ -n "$stayup" ]; then
+    phase switching
+    [ -n "$notice" ] && continue
+    notice=1
+    warn "The server is not running, and STAY_UP=1 keeps the container up so a model can be switched here:"
+    warn "  docker exec strata strata launch --family qwen --model IQ3_XXS --data-dir /data/Strata-data --access lan --port $PORT --preset $PRESET --save-preset $PRESET --restart --no-tui"
+    warn "  (the preset that is saved is the model this container starts with next time. Leave MODEL and FAMILY empty in .env:"
+    warn "   a start with those set saves them over the preset, so a switch is lost at the next start.)"
+  elif [ "$bad" -ge 3 ]; then
     phase failed
     die "The server is no longer running. Last lines of its log are in /data/install and 'docker logs'." 1
   fi

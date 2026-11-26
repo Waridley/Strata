@@ -6,7 +6,7 @@
 #   docker build -t strata:src .                                        # RTX 20/30/40/50 (compiles for each, ~25 min)
 #   docker build -t strata:src --build-arg CUDA_ARCHITECTURES=86 .      # one card only (faster); 86 = RTX 30, 89 = RTX 40, 120 = RTX 50
 #   docker build -t strata:src-cuda12 --build-arg CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04 \
-#              --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" --build-arg BUILD_VISION=0 .   # GTX 10 / P100 / V100 (driver 575+)
+#              --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" --build-arg BUILD_VISION=0 --build-arg BUILD_DSV41=0 .   # GTX 10 / P100 / V100 (driver 575+)
 #   docker run --rm --gpus all -p 127.0.0.1:8080:8080 --ulimit memlock=-1 --shm-size 2g --stop-timeout 120 \
 #              -v strata-data:/data -e MODEL=IQ3_XXS -e API_KEY=change-me-please-123 strata:src
 #
@@ -14,6 +14,10 @@
 # a machine-code part per listed architecture (plus PTX for the newest, which later cards can JIT), and the runtime picks the one
 # matching your card. Narrow CUDA_ARCHITECTURES to your card for a faster build. Native code for the CPU that builds the image is NOT
 # used (STRATA_PORTABLE=ON), so the image runs on any x86-64 CPU with AVX2.
+#
+# The CUDA 13 build also compiles strata-dsv41, the DeepSeek-V4.1-Flash engine, and puts it beside `strata` in the package,
+# exactly as the release's Linux cuda13 package does (the Terminal looks for it there). BUILD_DSV41=0 leaves it out; the CUDA 12
+# (Pascal / Volta) variant has no DeepSeek path, so it must be left out there.
 #
 # Plain legacy-builder features only (no heredocs, no --mount). AMD (HIP) and Intel (SYCL) source builds: docs/AMD_HIP.md, docs/INTEL.md.
 
@@ -30,6 +34,7 @@ WORKDIR /src
 COPY . .
 ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
+ARG BUILD_DSV41=1
 ARG ENGINE_VERSION=
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
 # llama.cpp at the pinned commit (ggml for the engine, mtmd for pictures), exactly as setup.py fetches it
@@ -38,11 +43,13 @@ RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
     sm60=OFF; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do if [ "$a" -lt 75 ]; then sm60=ON; fi; done; \
+    dsv=OFF; [ "$BUILD_DSV41" = "1" ] && dsv=ON || true; \
     /venv/bin/cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
-        -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
+        -DSTRATA_EXPERIMENTAL_SM60=$sm60 -DSTRATA_BUILD_DSV41=$dsv \
         -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR=/src/third_party/llama.cpp; \
-    /venv/bin/cmake --build build --target strata strata_kq -j "$(nproc)"; \
+    targets="strata strata_kq"; [ "$BUILD_DSV41" = "1" ] && targets="$targets strata-dsv41" || true; \
+    /venv/bin/cmake --build build --target $targets -j "$(nproc)"; \
     if [ "$BUILD_VISION" = "1" ]; then \
       /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/src/third_party/llama.cpp \
           -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
@@ -56,6 +63,16 @@ RUN set -e; \
     ver="${ENGINE_VERSION:-$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)}"; \
     cudafull=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1); cudamajor=${cudafull%%.*}; \
     if [ "$cudamajor" = 13 ]; then mindriver=580.65; else mindriver=575.51; fi; \
+    req=""; \
+    if [ "$BUILD_DSV41" = "1" ]; then \
+      if [ "$cudamajor" != 13 ]; then echo "BUILD_DSV41=1 needs CUDA 13: the cuda12 (Pascal / Volta) variant has no DeepSeek path. Pass --build-arg BUILD_DSV41=0."; exit 1; fi; \
+      dsv_bin=""; \
+      if [ -f build/strata-dsv41 ]; then dsv_bin=build/strata-dsv41; elif [ -f build/src/dsv41/strata-dsv41 ]; then dsv_bin=build/src/dsv41/strata-dsv41; fi; \
+      [ -n "$dsv_bin" ] || { echo "BUILD_DSV41=1 but strata-dsv41 was not built"; exit 1; }; \
+      cp "$dsv_bin" /stage/strata-dsv41; \
+      python3 packaging/collect_libs.py --binary "$dsv_bin" --search /usr/local/cuda/lib64 --out /stage --also 'libcublasLt.so*'; \
+      req="--require-dsv41"; \
+    fi; \
     vision_archs=""; [ -f /stage/strata-vision ] && vision_archs=", \"vision_archs\": \"$CUDA_ARCHITECTURES\""; \
     echo "{\"version\": \"$ver\", \"source\": \"docker build\", \"archs\": \"$CUDA_ARCHITECTURES\", \"cuda\": \"$cudafull\", \"portable\": true${vision_archs}}" > /stage/BUILD.json; \
     python3 packaging/collect_libs.py --binary build/strata --search /usr/local/cuda/lib64 --out /stage --also 'libcublasLt.so*'; \
@@ -63,7 +80,7 @@ RUN set -e; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
     python3 packaging/package_engine.py --src /stage --backend cuda --version "$ver" --out /engine $archs --arch "compute_$last" \
         --min-driver nvidia=$mindriver --variant cuda$cudamajor --platform linux-x86_64 --build-id "docker-source-${ver}-cuda${cudafull}" --include SYSTEM-LIBS.txt --include 'libstrata_kq*' \
-        --include strata-vision; \
+        --include strata-vision $req; \
     for d in /engine/*/; do python3 packaging/package_engine.py --verify "$d"; python3 packaging/binary_deps.py "$d"; done
 
 # ---- 2. the Terminal (the release archive, built here)

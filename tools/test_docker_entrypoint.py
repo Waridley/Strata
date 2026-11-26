@@ -28,7 +28,7 @@ esac
 case "$*" in
   *"--list-presets --output json"*) if [ -n "${STUB_PRESET:-}" ]; then echo '{"presets": [{"name": "docker"}]}'; fi; exit 0 ;;
   *"--list-presets"*) if [ -n "${STUB_PRESET:-}" ]; then echo "docker   iq3_xxs   32K   fit to card   ${STUB_TUNED:-not tuned}"; fi; exit 0 ;;
-  *"launch --status"*) echo '{"running": [{"name": "docker", "state": "ready"}]}'; exit 0 ;;
+  *"launch --status"*) if [ "${STUB_READY:-1}" = 1 ]; then echo '{"running": [{"name": "docker", "state": "ready"}]}'; else echo '{"running": [{"name": "docker", "state": "starting", "phase": "loading"}]}'; fi; exit 0 ;;
   *"--show-key"*) echo "KEY-FROM-PRESET-0123456789"; exit 0 ;;
   *"launch --stop"*) echo "stopped" >> "$STUB_LOG"; exit 0 ;;
   *"launch --no-tui"*) echo "key-env=${STRATA_LAUNCH_KEY:-}" >> "$STUB_LOG"; [ -n "${STUB_FAIL:-}" ] && exit 6; exit 0 ;;
@@ -134,6 +134,27 @@ class Entrypoint(unittest.TestCase):
         r = subprocess.run([SH, str(self.script)], env=self.env(STUB_FAIL="1", MODEL="Q2_0"), capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 6)
         self.assertIn("stopped with code 6", r.stderr)
+
+    def test_stay_up_keeps_the_container_up_for_a_model_switch(self):
+        """STAY_UP=1: the container stays up when the server is not running, so a model can be switched in it with
+        `docker exec strata strata launch ... --restart` (docs/DOCKER.md, "Changing the model at runtime"). SIGTERM ends it
+        as before, and the switch command is in the log."""
+        p = self.start(MODEL="Q2_0", STAY_UP="1", STUB_READY="0")
+        time.sleep(12)                                   # the keep-up loop checks every 10 s: the server is not ready twice
+        self.assertIsNone(p.poll(), "the container must stay up while the server is not running")
+        self.assertIn("switching", (self.tmp / "phase").read_text())
+        code, out, err = self.stop(p)
+        self.assertEqual(code, 0, err)
+        self.assertIn("STAY_UP=1 keeps the container up", err)
+        self.assertIn("docker exec strata strata launch --family qwen --model IQ3_XXS", err)
+        self.assertIn("launch --stop --preset docker", self.log.read_text())
+        self.assertIn("stopping", (self.tmp / "phase").read_text())
+
+    def test_the_container_leaves_when_the_server_is_gone_without_stay_up(self):
+        r = subprocess.run([SH, str(self.script)], env=self.env(MODEL="Q2_0", STUB_READY="0"), capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("The server is no longer running", r.stderr)
+        self.assertNotIn("docker exec strata strata launch", r.stderr)
 
     def test_bad_vision_value_is_a_plain_error(self):
         r = subprocess.run([SH, str(self.script)], env=self.env(VISION="maybe"), capture_output=True, text=True, timeout=30)

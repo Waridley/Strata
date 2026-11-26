@@ -95,3 +95,6 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# the compose .env a user copies from .env.example (holds the API key)
+docker/compose/.env
